@@ -8,7 +8,7 @@
 
 | Champ | Valeur |
 | --- | --- |
-| Session | `2 avril 2026` |
+| Session | `10 septembre 2026` |
 | Modalite | Mise en situation professionnelle simulee individuelle |
 | Duree | `5 heures` |
 | Organisation | `Partie 1 : 9h – 12h` — `Partie 2 : 13h – 15h` |
