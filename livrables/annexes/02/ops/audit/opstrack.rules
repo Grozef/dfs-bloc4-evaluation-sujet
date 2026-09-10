@@ -1,0 +1,12 @@
+-w /var/www/opstrack/.env -p wa -k opstrack-secrets
+-w /var/www/opstrack/microservices/dispatch-dashboard/.env.local -p wa -k opstrack-secrets
+-w /etc/opstrack/ -p wa -k opstrack-secrets
+-w /etc/sudoers -p wa -k opstrack-privileges
+-w /etc/sudoers.d/ -p wa -k opstrack-privileges
+-w /home/ubuntu/.ssh/authorized_keys -p wa -k opstrack-ssh
+-w /etc/ssh/sshd_config -p wa -k opstrack-ssh
+-w /etc/ssh/sshd_config.d/ -p wa -k opstrack-ssh
+-w /etc/apache2/sites-available/ -p wa -k opstrack-web
+-w /etc/apache2/conf-available/ -p wa -k opstrack-web
+-w /var/www/opstrack/public/ -p wa -k opstrack-webroot
+-w /etc/ufw/ -p wa -k opstrack-firewall
