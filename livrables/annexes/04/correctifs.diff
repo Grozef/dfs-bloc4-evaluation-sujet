@@ -1,0 +1,245 @@
+diff --git a/app/Http/Controllers/Api/TicketController.php b/app/Http/Controllers/Api/TicketController.php
+index 327a445..82831bc 100644
+--- a/app/Http/Controllers/Api/TicketController.php
++++ b/app/Http/Controllers/Api/TicketController.php
+@@ -22,8 +22,8 @@ public function index(Request $request)
+         $query = Ticket::query()->with(['site', 'openedBy', 'assignedTo', 'interventions']);
+ 
+         if ($search = $request->string('search')->toString()) {
+-            $query->where('title', 'like', "%{$search}%")
+-                ->orWhereRaw("reference like '%{$search}%'");
++            $query->where(fn ($q) => $q->where('title', 'like', "%{$search}%")
++                ->orWhere('reference', 'like', "%{$search}%"));
+         }
+ 
+         if ($priority = $request->string('priority')->toString()) {
+diff --git a/app/Http/Controllers/DashboardController.php b/app/Http/Controllers/DashboardController.php
+index ad4d867..199e949 100644
+--- a/app/Http/Controllers/DashboardController.php
++++ b/app/Http/Controllers/DashboardController.php
+@@ -18,8 +18,6 @@ public function __invoke(): View
+             ->get();
+ 
+         return view('dashboard.index', [
+-            // Intentional defect for the assessment: this cache is not invalidated
+-            // when tickets are updated, which makes dashboard KPIs drift.
+             'kpis' => Cache::remember('dashboard.kpis', now()->addMinutes(30), function (): array {
+                 return [
+                     'openTickets' => Ticket::query()->whereNotIn('status', ['resolved', 'closed'])->count(),
+diff --git a/app/Http/Controllers/WebhookController.php b/app/Http/Controllers/WebhookController.php
+index 8d3a615..09c7c10 100644
+--- a/app/Http/Controllers/WebhookController.php
++++ b/app/Http/Controllers/WebhookController.php
+@@ -7,6 +7,7 @@
+ use App\Services\EventLogService;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\IpUtils;
+ 
+ class WebhookController extends Controller
+ {
+@@ -16,22 +17,44 @@ public function __construct(private readonly EventLogService $eventLogService)
+ 
+     public function handle(Request $request): JsonResponse
+     {
+-        if ($request->getUser() !== config('services.webhook.basic_user')
+-            || $request->getPassword() !== config('services.webhook.basic_password')) {
++        $allowedIps = config('services.webhook.allowed_ips');
++
++        if ($allowedIps !== [] && ! IpUtils::checkIp((string) $request->ip(), $allowedIps)) {
++            return response()->json(['message' => 'Forbidden'], 403);
++        }
++
++        $user = config('services.webhook.basic_user');
++        $password = config('services.webhook.basic_password');
++        $secret = config('services.webhook.signing_secret');
++
++        if (blank($user) || blank($password) || blank($secret)
++            || $request->getUser() !== $user
++            || $request->getPassword() !== $password) {
+             return response()->json(['message' => 'Unauthorized'], 401, [
+                 'WWW-Authenticate' => 'Basic realm="OpsTrack Webhook"',
+             ]);
+         }
+ 
++        $signature = hash_hmac('sha256', $request->getContent(), $secret);
++
++        if (! hash_equals($signature, (string) $request->header('X-OpsTrack-Signature'))) {
++            return response()->json(['message' => 'Invalid signature.'], 401);
++        }
++
+         $payload = $request->validate([
+             'ticket_reference' => ['required', 'string'],
+-            'status' => ['required', 'string'],
++            'status' => ['required', 'in:new,scheduled,in_progress,resolved,closed'],
+             'summary' => ['nullable', 'string'],
+-            'external_event_id' => ['nullable', 'string'],
++            'external_event_id' => ['nullable', 'string', 'max:255'],
+         ]);
+ 
+         $ticket = Ticket::query()->where('reference', $payload['ticket_reference'])->firstOrFail();
+ 
++        if (isset($payload['external_event_id'])
++            && Intervention::query()->where('external_event_id', $payload['external_event_id'])->exists()) {
++            return response()->json(['message' => 'Webhook already processed.']);
++        }
++
+         $intervention = Intervention::query()->create([
+             'ticket_id' => $ticket->id,
+             'scheduled_for' => now()->addHour(),
+@@ -40,9 +63,13 @@ public function handle(Request $request): JsonResponse
+             'external_event_id' => $payload['external_event_id'] ?? null,
+         ]);
+ 
+-        // Intentional defect for the assessment: webhook processing acknowledges
+-        // the external status but leaves the ticket in a scheduled state.
+-        $ticket->update(['status' => 'scheduled']);
++        $ticket->status = $payload['status'];
++
++        if ($ticket->isDirty('status') && in_array($ticket->status, ['resolved', 'closed'], true)) {
++            $ticket->closed_at = now();
++        }
++
++        $ticket->save();
+ 
+         $this->eventLogService->record('webhook', 'intervention.synced', [
+             'ticket_id' => $ticket->id,
+diff --git a/app/Http/Middleware/EnsureApiTokenIsValid.php b/app/Http/Middleware/EnsureApiTokenIsValid.php
+index a5fc27b..1d74749 100644
+--- a/app/Http/Middleware/EnsureApiTokenIsValid.php
++++ b/app/Http/Middleware/EnsureApiTokenIsValid.php
+@@ -14,7 +14,7 @@ class EnsureApiTokenIsValid
+      *
+      * @param  Closure(Request): (Response)  $next
+      */
+-    public function handle(Request $request, Closure $next): Response
++    public function handle(Request $request, Closure $next, ?string $ability = null): Response
+     {
+         $tokenValue = $request->bearerToken() ?: $request->header('X-Api-Token');
+ 
+@@ -31,6 +31,10 @@ public function handle(Request $request, Closure $next): Response
+             return response()->json(['message' => 'Invalid API token.'], Response::HTTP_UNAUTHORIZED);
+         }
+ 
++        if ($ability !== null && ! in_array($ability, $token->abilities ?? [], true)) {
++            return response()->json(['message' => 'Insufficient token ability.'], Response::HTTP_FORBIDDEN);
++        }
++
+         $token->forceFill(['last_used_at' => now()])->save();
+ 
+         return $next($request);
+diff --git a/app/Models/Ticket.php b/app/Models/Ticket.php
+index 31d58ed..b7b5a17 100644
+--- a/app/Models/Ticket.php
++++ b/app/Models/Ticket.php
+@@ -4,6 +4,7 @@
+ 
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
++use Illuminate\Support\Facades\Cache;
+ 
+ class Ticket extends Model
+ {
+@@ -32,6 +33,14 @@ protected function casts(): array
+         ];
+     }
+ 
++    protected static function booted(): void
++    {
++        $forgetKpis = fn () => Cache::forget('dashboard.kpis');
++
++        static::saved($forgetKpis);
++        static::deleted($forgetKpis);
++    }
++
+     public function site()
+     {
+         return $this->belongsTo(Site::class);
+diff --git a/config/services.php b/config/services.php
+index bfd8d16..766ae78 100644
+--- a/config/services.php
++++ b/config/services.php
+@@ -36,8 +36,10 @@
+     ],
+ 
+     'webhook' => [
+-        'basic_user' => env('WEBHOOK_BASIC_USER', 'user'),
+-        'basic_password' => env('WEBHOOK_BASIC_PASSWORD', 'password'),
++        'basic_user' => env('WEBHOOK_BASIC_USER'),
++        'basic_password' => env('WEBHOOK_BASIC_PASSWORD'),
++        'signing_secret' => env('WEBHOOK_SIGNING_SECRET'),
++        'allowed_ips' => array_filter(array_map('trim', explode(',', (string) env('WEBHOOK_ALLOWED_IPS')))),
+     ],
+ 
+     'public_weather' => [
+diff --git a/database/migrations/2026_03_14_183114_create_interventions_table.php b/database/migrations/2026_03_14_183115_create_interventions_table.php
+similarity index 100%
+rename from database/migrations/2026_03_14_183114_create_interventions_table.php
+rename to database/migrations/2026_03_14_183115_create_interventions_table.php
+diff --git a/microservices/dispatch-dashboard/lib/api.ts b/microservices/dispatch-dashboard/lib/api.ts
+index 844defa..c5d6967 100644
+--- a/microservices/dispatch-dashboard/lib/api.ts
++++ b/microservices/dispatch-dashboard/lib/api.ts
+@@ -15,5 +15,5 @@ export async function fetchTickets() {
+   }
+ 
+   const payload = await response.json();
+-  return payload.items ?? [];
++  return payload.data ?? [];
+ }
+diff --git a/public/hooks.php b/public/hooks.php
+index 0ec3f2c..318f501 100644
+--- a/public/hooks.php
++++ b/public/hooks.php
+@@ -1,6 +1,7 @@
+ <?php
+ 
+ use App\Http\Controllers\WebhookController;
++use Illuminate\Contracts\Debug\ExceptionHandler;
+ use Illuminate\Http\Request;
+ 
+ require __DIR__.'/../vendor/autoload.php';
+@@ -9,7 +10,18 @@
+ $kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
+ 
+ $request = Request::capture();
+-$response = $app->make(WebhookController::class)->handle($request);
++$request->headers->set('Accept', 'application/json');
++$app->instance('request', $request);
++$kernel->bootstrap();
++
++try {
++    $response = $app->make(WebhookController::class)->handle($request);
++} catch (Throwable $e) {
++    $handler = $app->make(ExceptionHandler::class);
++    $handler->report($e);
++    $response = $handler->render($request, $e);
++}
++
+ $response->send();
+ 
+ $kernel->terminate($request, $response);
+diff --git a/routes/api.php b/routes/api.php
+index 9c5c5c8..dc3d86c 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -12,14 +12,15 @@
+ ]));
+ 
+ Route::prefix('v1')
+-    ->middleware('api.token')
+     ->group(function (): void {
+         Route::apiResource('tickets', TicketController::class)->only([
+             'index',
+             'store',
+             'show',
+             'update',
+-        ]);
+-        Route::get('technicians', [TechnicianController::class, 'index']);
+-        Route::get('external/weather', [ExternalContextController::class, 'weather']);
++        ])
++            ->middlewareFor(['index', 'show'], 'api.token:tickets:read')
++            ->middlewareFor(['store', 'update'], 'api.token:tickets:write');
++        Route::get('technicians', [TechnicianController::class, 'index'])->middleware('api.token:tickets:read');
++        Route::get('external/weather', [ExternalContextController::class, 'weather'])->middleware('api.token:weather:read');
+     });
