@@ -1,0 +1,102 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Environnements a deployer
+        type: choice
+        options:
+          - qualif-puis-production
+          - qualif
+        default: qualif-puis-production
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Controles qualite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mongodb, pdo_sqlite, intl, bcmath, zip
+          tools: composer:v2
+
+      - name: Dependances PHP
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Syntaxe PHP
+        run: find app bootstrap config database public routes -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
+
+      - name: Tests
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          composer test
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build du microservice
+        working-directory: microservices/dispatch-dashboard
+        run: npm install --no-audit --no-fund && npm run build
+
+  qualif:
+    name: Deploiement qualification
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acces SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Deploiement
+        run: ssh -i ~/.ssh/id_deploy ubuntu@${{ vars.QUALIF_HOST }} "REMOTE=fork REF=${{ github.sha }} bash -s" < ops/deploy.sh
+
+      - name: Smoke test
+        run: bash ops/smoke.sh http://${{ vars.QUALIF_HOST }}
+
+  production:
+    name: Deploiement production
+    needs: qualif
+    if: inputs.target == 'qualif-puis-production'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acces SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Deploiement
+        run: ssh -i ~/.ssh/id_deploy ubuntu@${{ vars.PROD_HOST }} "REMOTE=origin REF=${{ github.sha }} bash -s" < ops/deploy.sh
+
+      - name: Smoke test
+        run: bash ops/smoke.sh https://${{ vars.PROD_HOST }}
+
+  alert:
+    name: Alerte en cas d'echec
+    needs: [quality, qualif, production]
+    if: failure()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Notification ntfy
+        run: |
+          curl -s -H "Title: OpsTrack deploiement" -H "Priority: high" -H "Tags: rotating_light" \
+            -d "Echec du workflow ${{ github.workflow }} #${{ github.run_number }} sur ${{ github.sha }}" \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
