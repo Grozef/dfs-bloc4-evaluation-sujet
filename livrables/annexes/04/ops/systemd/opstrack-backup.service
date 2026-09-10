@@ -1,0 +1,8 @@
+[Unit]
+Description=OpsTrack sauvegarde MySQL, MongoDB et configuration
+After=mysql.service mongod.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/opstrack/backup.env
+ExecStart=/bin/bash /var/www/opstrack/ops/backup.sh

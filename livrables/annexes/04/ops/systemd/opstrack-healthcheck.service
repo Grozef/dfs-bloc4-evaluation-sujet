@@ -1,0 +1,8 @@
+[Unit]
+Description=OpsTrack sondes de supervision
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/opstrack/healthcheck.env
+ExecStart=/bin/bash /var/www/opstrack/ops/healthcheck.sh
