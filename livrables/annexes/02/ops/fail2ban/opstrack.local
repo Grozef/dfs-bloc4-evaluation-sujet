@@ -1,0 +1,7 @@
+[sshd]
+enabled = true
+# Ubuntu 24.04 : sshd journalise sous ssh.service, le filtre par defaut attend sshd.service.
+journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
+maxretry = 5
+findtime = 10m
+bantime = 1h

@@ -1,0 +1,10 @@
+/var/www/opstrack/storage/logs/*.log {
+    su ubuntu www-data
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
